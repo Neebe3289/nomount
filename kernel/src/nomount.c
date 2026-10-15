@@ -288,25 +288,18 @@ static void nomount_init_prealloc_inode(struct inode *inode, struct nm_inode_inf
     if (!S_ISLNK(inode->i_mode)) inode->i_opflags |= IOP_NOFOLLOW;
 }
 
-static bool nm_inode_matches_binding(struct inode *inode, const struct path *path,
-                                     struct nomount_dir_node *dir_node)
+static int nm_cached_inode_test(struct inode *inode, void *data)
 {
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
+    struct nm_inode_info *binding = data;
     struct inode *r_inode;
 
-    if (!info || info->dir_node != dir_node || !path_equal(&info->r_path, path))
-        return false;
-    r_inode = path->dentry ? d_backing_inode(path->dentry) : NULL;
+    if (inode->i_op != &nm_dir_iops || !info || info->dir_node != binding->dir_node || !path_equal(&info->r_path, &binding->r_path))
+        return 0;
+    r_inode = binding->r_path.dentry ? d_backing_inode(binding->r_path.dentry) : NULL;
     return !r_inode || (inode->i_state & I_NEW) ||
            (inode->i_mode == r_inode->i_mode && uid_eq(inode->i_uid, r_inode->i_uid) &&
             gid_eq(inode->i_gid, r_inode->i_gid));
-}
-
-static int nm_cached_inode_test(struct inode *inode, void *data)
-{
-    struct nm_inode_info *info = data;
-    return inode->i_op == &nm_dir_iops &&
-           nm_inode_matches_binding(inode, &info->r_path, info->dir_node);
 }
 
 static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dentry, struct nm_rule_info *rule_info)
@@ -1189,7 +1182,6 @@ static void nm_invalidate_vpath(const char *v_path, size_t v_len)
 {
     struct path parent_path;
     struct dentry *child;
-    struct qstr qname;
     char *parent_buf;
     int slash;
 
@@ -1209,17 +1201,7 @@ static void nm_invalidate_vpath(const char *v_path, size_t v_len)
     }
     kfree(parent_buf);
 
-    qname.name = v_path + slash + 1;
-    qname.len = v_len - slash - 1;
-    qname.hash = full_name_hash(parent_path.dentry, qname.name, qname.len);
-    if (parent_path.dentry->d_flags & DCACHE_OP_HASH) {
-        if (parent_path.dentry->d_op->d_hash(parent_path.dentry, &qname) < 0) {
-            path_put(&parent_path);
-            return;
-        }
-    }
-
-    child = d_lookup(parent_path.dentry, &qname);
+    child = nm_hash_and_lookup(parent_path.dentry, &(struct qstr)QSTR_INIT(v_path + slash + 1, v_len - slash - 1));
     if (child) {
         d_drop(child);
         dput(child);
