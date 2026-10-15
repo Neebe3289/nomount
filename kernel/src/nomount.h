@@ -56,10 +56,6 @@ struct nm_dir_ops {
     const struct file_operations *orig_fop;
     struct nomount_dir_node *dir_node;
     struct rcu_head rcu;
-
-    /* Dentry Operations Hijacking */
-    struct dentry_operations fake_dops;
-    const struct dentry_operations *orig_dops;
 };
 
 struct nm_sop {
@@ -177,14 +173,11 @@ static const struct file_operations nm_file_fops;
 static const struct inode_operations nm_file_iops;
 static const struct file_operations nm_dir_fops;
 static const struct inode_operations nm_dir_iops;
-static const struct dentry_operations nm_dops;
-static const struct dentry_operations nm_owned_dops;
 
 /*** forward declarations ***/
 static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nomount_hijacked_evict_inode(struct inode *inode);
-static void nomount_hijack_dentry_ops(struct inode *dir, struct dentry *dentry, bool injected);
 static void nm_dir_put(struct nomount_dir_node *dir_node);
 
 /* =====================================================================
@@ -409,26 +402,6 @@ static inline struct nm_sop *nm_get_nm_sop(const struct super_operations *sop) {
     if (likely(sop) && sop->evict_inode == nomount_hijacked_evict_inode)
         return container_of(sop, struct nm_sop, fake_sop);
     return NULL;
-}
-
-#define NM_DOP_INITIALIZING ((const struct dentry_operations *)1L)
-static inline const struct dentry_operations *nm_get_orig_dops(struct nm_dir_ops *iop)
-{
-    const struct dentry_operations *dops;
-    if (!iop) return NULL;
-    dops = smp_load_acquire(&iop->orig_dops);
-    return (dops == NM_DOP_INITIALIZING) ? NULL : dops;
-}
-
-static inline int nm_call_orig_revalidate(const struct dentry_operations *dops, struct inode *parent_inode,
-                                          const struct qstr *name, struct dentry *dentry, unsigned int flags)
-{
-    if (!dops || !dops->d_revalidate) return 1;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
-    return dops->d_revalidate(parent_inode, name, dentry, flags);
-#else
-    return dops->d_revalidate(dentry, flags);
-#endif
 }
 
 /* RCU read lock scope guard */
