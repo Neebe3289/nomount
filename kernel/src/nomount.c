@@ -1288,6 +1288,15 @@ static void nm_invalidate_vpath(const char *v_path, size_t v_len)
     path_put(&parent_path);
 }
 
+static void nm_invalidate_all_leaves(void)
+{
+    struct nomount_leaf *leaf;
+    int bkt;
+
+    hash_for_each(nomount_leaves_ht, bkt, leaf, ht_node)
+        nm_invalidate_vpath(leaf->paths, leaf->v_len);
+}
+
 static void nm_free_leaf(struct nomount_leaf *leaf)
 {
     if (leaf->anchor.dentry) path_put(&leaf->anchor);
@@ -1660,6 +1669,7 @@ static void __nomount_clear_all(int clear_flags)
         struct nm_uid_array *old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_mutex));
         RCU_INIT_POINTER(nomount_uids, NULL);
         if (old) kfree_rcu(old, rcu);
+        nm_invalidate_all_leaves();
     }
     if (clear_flags & NM_CLEAR_RULES) {
         struct nomount_leaf *leaf;
@@ -1785,17 +1795,26 @@ static int nm_process_payload(unsigned long user_addr)
         case NM_CMD_ADD_UID:
             mutex_lock(&nomount_mutex);
             payload->status = nm_uid_add(payload->target_uid);
+            if (payload->status == 0)
+                nm_invalidate_all_leaves();
             mutex_unlock(&nomount_mutex);
             break;
 
         case NM_CMD_DEL_UID:
             mutex_lock(&nomount_mutex);
             payload->status = nm_uid_del(payload->target_uid);
+            if (payload->status == 0)
+                nm_invalidate_all_leaves();
             mutex_unlock(&nomount_mutex);
             break;
 
         case NM_CMD_BLOCK_ISOLATED_UIDS:
-            WRITE_ONCE(nm_block_isolated_uids, payload->arg1 != 0);
+            if (READ_ONCE(nm_block_isolated_uids) != (payload->arg1 != 0)) {
+                mutex_lock(&nomount_mutex);
+                WRITE_ONCE(nm_block_isolated_uids, payload->arg1 != 0);
+                nm_invalidate_all_leaves();
+                mutex_unlock(&nomount_mutex);
+            }
             break;
 
         case NM_CMD_GET_ISOLATED_STATE:
