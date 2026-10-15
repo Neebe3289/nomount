@@ -1245,6 +1245,49 @@ static int nm_resolve_anchor_locked(struct nomount_leaf *leaf)
     return 0;
 }
 
+static void nm_invalidate_vpath(const char *v_path, size_t v_len)
+{
+    struct path parent_path;
+    struct dentry *child;
+    struct qstr qname;
+    char *parent_buf;
+    int slash;
+
+    while (v_len > 1 && v_path[v_len - 1] == '/') v_len--;
+    for (slash = v_len - 1; slash > 0; slash--)
+        if (v_path[slash] == '/') break;
+    if (slash == 0) return;
+
+    parent_buf = kmalloc(slash + 1, GFP_KERNEL);
+    if (!parent_buf) return;
+    memcpy(parent_buf, v_path, slash);
+    parent_buf[slash] = '\0';
+
+    if (kern_path(parent_buf, LOOKUP_FOLLOW, &parent_path) != 0) {
+        kfree(parent_buf);
+        return;
+    }
+    kfree(parent_buf);
+
+    qname.name = v_path + slash + 1;
+    qname.len = v_len - slash - 1;
+    qname.hash = full_name_hash(parent_path.dentry, qname.name, qname.len);
+    if (parent_path.dentry->d_flags & DCACHE_OP_HASH) {
+        if (parent_path.dentry->d_op->d_hash(parent_path.dentry, &qname) < 0) {
+            path_put(&parent_path);
+            return;
+        }
+    }
+
+    child = d_lookup(parent_path.dentry, &qname);
+    if (child) {
+        d_drop(child);
+        dput(child);
+    }
+
+    path_put(&parent_path);
+}
+
 static void nm_free_leaf(struct nomount_leaf *leaf)
 {
     if (leaf->anchor.dentry) path_put(&leaf->anchor);
@@ -1625,6 +1668,7 @@ static void __nomount_clear_all(int clear_flags)
         hash_for_each_safe(nomount_leaves_ht, bkt, tmp, leaf, ht_node) {
             __nomount_delete_child_locked(leaf, true);
             if (leaf->this_dir) leaf->this_dir->owner = NULL;
+            nm_invalidate_vpath(leaf->paths, leaf->v_len);
             hash_del_rcu(&leaf->ht_node);
             nm_retire_leaf(leaf);
         }
@@ -1659,9 +1703,11 @@ static int nm_process_payload(unsigned long user_addr)
 
         case NM_CMD_ADD_RULE: {
             unsigned int data_size = payload->data_size, offset = payload->arg1;
+            char *batch_start, *batch_end;
             if (data_size > sizeof(payload->buffer) || offset > data_size) { payload->status = -EINVAL; break; }
             buf_ptr = payload->buffer + offset;
             buf_end = payload->buffer + data_size;
+            batch_start = buf_ptr;
             mutex_lock(&nomount_mutex);
             while (buf_ptr < buf_end) {
                 struct nm_rule_hdr h;
@@ -1681,16 +1727,31 @@ static int nm_process_payload(unsigned long user_addr)
                 if (!payload->status) payload->status = err;
                 buf_ptr += (size_t)(h.v_len + h.r_len);
             }
+            batch_end = buf_ptr;
+            payload->arg1 = batch_end - payload->buffer;
+
+            buf_ptr = batch_start;
+            while (buf_ptr < batch_end) {
+                struct nm_rule_hdr h;
+                if ((size_t)(batch_end - buf_ptr) < sizeof(h)) break;
+                h = *(struct nm_rule_hdr *)buf_ptr;
+                if (unlikely(!h.v_len || h.v_len >= PATH_MAX)) break;
+                buf_ptr += sizeof(h);
+                nm_invalidate_vpath(buf_ptr, h.v_len);
+                buf_ptr += (size_t)(h.v_len + h.r_len);
+            }
+
             mutex_unlock(&nomount_mutex);
-            payload->arg1 = buf_ptr - payload->buffer;
             break;
         }
 
         case NM_CMD_DEL_RULE: {
             unsigned int data_size = payload->data_size, offset = payload->arg1;
+            char *batch_start, *batch_end;
             if (data_size > sizeof(payload->buffer) || offset > data_size) { payload->status = -EINVAL; break; }
             buf_ptr = payload->buffer + offset;
             buf_end = payload->buffer + data_size;
+            batch_start = buf_ptr;
             mutex_lock(&nomount_mutex);
             while (buf_ptr < buf_end) {
                 struct nm_del_hdr h;
@@ -1703,8 +1764,21 @@ static int nm_process_payload(unsigned long user_addr)
                 if (!payload->status) payload->status = err;
                 buf_ptr += h.v_len;
             }
+            batch_end = buf_ptr;
+            payload->arg1 = batch_end - payload->buffer;
+
+            buf_ptr = batch_start;
+            while (buf_ptr < batch_end) {
+                struct nm_del_hdr h;
+                if ((size_t)(batch_end - buf_ptr) < sizeof(h)) break;
+                h = *(struct nm_del_hdr *)buf_ptr;
+                if (!h.v_len) break;
+                buf_ptr += sizeof(h);
+                nm_invalidate_vpath(buf_ptr, h.v_len);
+                buf_ptr += h.v_len;
+            }
+
             mutex_unlock(&nomount_mutex);
-            payload->arg1 = buf_ptr - payload->buffer;
             break;
         }
 

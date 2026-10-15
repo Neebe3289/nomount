@@ -7,6 +7,7 @@ ui_print " "
 
 ui_print "- Device Architecture: $ARCH"
 
+# Check root implementation
 if [ "$KSU" = "true" ] || command -v ksud >/dev/null 2>&1 || [ -x /data/adb/ksu/bin/ksud ]; then
   ROOT_IMP=ksu
   ui_print "- Root implementation: KernelSU"
