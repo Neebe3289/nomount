@@ -309,17 +309,9 @@ static int nm_cached_inode_test(struct inode *inode, void *data)
            nm_inode_matches_binding(inode, &info->r_path, info->dir_node);
 }
 
-static int nm_cached_inode_set(struct inode *inode, void *data)
-{
-    inode->i_private = data;
-    inode->i_op = &nm_dir_iops;
-    return 0;
-}
-
-
 static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dentry, struct nm_rule_info *rule_info)
 {
-    struct nm_inode_info *info = NULL;
+    struct nm_inode_info probe, *info = NULL;
     struct inode *inode;
     struct dentry *res = ERR_PTR(-ENODATA);
 
@@ -329,22 +321,30 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
         goto out;
     }
 
+    if (rule_info->this_dir) {
+        probe.r_path = rule_info->r_path;
+        probe.dir_node = rule_info->this_dir;
+        inode = iget5_locked(dir->i_sb, (unsigned long)rule_info->this_dir, nm_cached_inode_test, NULL, &probe);
+        if (!inode) goto out;
+        if (!(inode->i_state & I_NEW)) {
+            res = d_splice_alias(inode, dentry);
+            goto out;
+        }
+        if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) { iget_failed(inode); goto out; }
+        *info = probe;
+        nomount_init_prealloc_inode(inode, info, rule_info->v_ino);
+        unlock_new_inode(inode);
+        res = d_splice_alias(inode, dentry);
+        return res;
+    }
+
     if (!(info = kmalloc(sizeof(*info), GFP_KERNEL))) goto out;
     info->r_path = rule_info->r_path;
-    info->dir_node = rule_info->this_dir;
-    if (rule_info->this_dir)
-        inode = iget5_locked(dir->i_sb, (unsigned long)rule_info->this_dir, nm_cached_inode_test, nm_cached_inode_set, info);
-    else
-        inode = new_inode(dir->i_sb);
+    info->dir_node = NULL;
+    if (!(inode = new_inode(dir->i_sb))) goto out;
+    nomount_init_prealloc_inode(inode, info, rule_info->v_ino);
+    return d_splice_alias(inode, dentry);
 
-    if (!inode) goto out;
-    if (!rule_info->this_dir || (inode->i_state & I_NEW)) {
-        nomount_init_prealloc_inode(inode, info, rule_info->v_ino);
-        info = NULL;
-        if (rule_info->this_dir) unlock_new_inode(inode);
-    }
-    res = d_splice_alias(inode, dentry);
-    if (!info) return res;
 out:
     kfree(info);
     nm_dir_put(rule_info->this_dir);
