@@ -1498,7 +1498,6 @@ static int __nomount_del_rule(const char *path, u16 len, unsigned int uid)
 {
     struct nomount_leaf *leaf;
     struct nm_rule_array *old, *array = NULL;
-    struct nomount_dir_node *parent = NULL;
     int pos = 0, new_count;
     size_t heap_size = 0;
     bool stub_virtual = false;
@@ -1515,7 +1514,7 @@ static int __nomount_del_rule(const char *path, u16 len, unsigned int uid)
     }
 
     if (!stub_virtual && old->count == 1 && (!leaf->this_dir || !rcu_access_pointer(leaf->this_dir->children))) {
-        parent = nm_detach_leaf_locked(leaf);
+        struct nomount_dir_node *parent = nm_detach_leaf_locked(leaf);
         if (IS_ERR(parent)) return PTR_ERR(parent);
         return parent ? nomount_prune_empty_virtual_dirs(parent) : 0;
     }
@@ -1552,16 +1551,18 @@ static int __nomount_del_rule(const char *path, u16 len, unsigned int uid)
 
     rcu_assign_pointer(leaf->rules, array);
     nm_retire_array(old);
-    return parent ? nomount_prune_empty_virtual_dirs(parent) : 0;
+    return 0;
 }
 
 static void __nomount_clear_all(int clear_flags)
 {
     if (clear_flags & NM_CLEAR_UIDS) {
         struct nm_uid_array *old = rcu_dereference_protected(nomount_uids, lockdep_is_held(&nomount_mutex));
-        RCU_INIT_POINTER(nomount_uids, NULL);
-        if (old) kfree_rcu(old, rcu);
-        nm_invalidate_all_leaves();
+        if (old) {
+            RCU_INIT_POINTER(nomount_uids, NULL);
+            kfree_rcu(old, rcu);
+            nm_invalidate_all_leaves();
+        }
     }
     if (clear_flags & NM_CLEAR_RULES) {
         struct nomount_leaf *leaf;
