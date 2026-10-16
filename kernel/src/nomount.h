@@ -334,6 +334,12 @@ struct nm_del_hdr {
     #define NM_ACTOR_CONTINUE 0
 #endif
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 19, 0)
+    #define nm_inode_is_new(inode) (inode_state_read_once(inode) & I_NEW)
+#else
+    #define nm_inode_is_new(inode) (inode->i_state & I_NEW)
+#endif
+
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 12, 0) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 2, 0)
     #define FLAGS_ARG , int flags
     #define FLAGS_VAL , flags

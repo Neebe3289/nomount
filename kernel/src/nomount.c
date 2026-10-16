@@ -306,8 +306,7 @@ static int nm_cached_inode_test(struct inode *inode, void *data)
     if (inode->i_op != &nm_dir_iops || !info || info->dir_node != binding->dir_node || !path_equal(&info->r_path, &binding->r_path))
         return 0;
     r_inode = binding->r_path.dentry ? d_backing_inode(binding->r_path.dentry) : NULL;
-    return !r_inode || (inode->i_state & I_NEW) ||
-           (inode->i_mode == r_inode->i_mode && uid_eq(inode->i_uid, r_inode->i_uid) &&
+    return !r_inode || nm_inode_is_new(inode) || (inode->i_mode == r_inode->i_mode && uid_eq(inode->i_uid, r_inode->i_uid) &&
             gid_eq(inode->i_gid, r_inode->i_gid));
 }
 
@@ -328,7 +327,7 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
         probe.dir_node = rule_info->this_dir;
         inode = iget5_locked(dir->i_sb, (unsigned long)rule_info->this_dir, nm_cached_inode_test, NULL, &probe);
         if (!inode) goto out;
-        if (!(inode->i_state & I_NEW)) {
+        if (!nm_inode_is_new(inode)) {
             res = d_splice_alias(inode, dentry);
             goto out;
         }
