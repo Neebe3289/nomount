@@ -304,7 +304,8 @@ static inline void nm_mark_uncacheable(struct dentry *dentry)
         kfree(ops);
         return;
     }
-    if (ops->orig) ops->fake = *(ops->orig = dentry->d_op);
+    ops->orig = dentry->d_op;
+    if (ops->orig) ops->fake = *ops->orig;
     ops->fake.d_delete = nm_d_delete;
     ops->fake.d_release = nm_d_release;
     dentry->d_op = &ops->fake;
