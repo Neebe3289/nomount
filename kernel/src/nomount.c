@@ -85,33 +85,7 @@ static struct nm_rule *nm_select_rule(struct nomount_leaf *leaf, unsigned int ui
     return !arr->rules[0].target_uid ? &arr->rules[0] : NULL;
 }
 
-static struct nm_rule *nm_lookup_rule(struct nomount_dir_node *dir_node, const char *name, size_t len, uid_t fsuid, struct nomount_leaf **leaf_out)
-{
-    struct nomount_child_array *children;
-    struct nomount_leaf *leaf = NULL;
-    struct nm_rule *rule = NULL;
-
-    if (likely((children = rcu_dereference(dir_node->children)))) {
-        u32 bloom_h = nm_qhash(name, len);
-        if (!children->bloom_words) {
-            struct nm_child *entries = nm_entries(children);
-            for (int i = 0; i < children->count; i++) {
-                if (entries[i].bloom_hash == bloom_h && nm_child_matches(entries[i].leaf, name, len)) {
-                    leaf = entries[i].leaf;
-                    break;
-                }
-            }
-        } else if (unlikely(nm_bloom_test(children, bloom_h))) {
-            u32 hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, name, len);
-            leaf = nomount_bsearch_child(children, name, len, hash, NULL);
-        }
-    }
-    if (leaf) rule = nm_select_rule(leaf, fsuid);
-    if (rule && leaf_out) *leaf_out = leaf;
-    return rule;
-}
-
-static bool nm_resolve_rule_from_leaf(struct nomount_dir_node *dir_node, struct nomount_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
+static bool nm_resolve_rule_from_leaf(struct nomount_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
 {
     struct nm_rule *rule = nm_select_rule(leaf, fsuid);
     if (!rule) return false;
@@ -145,11 +119,6 @@ static struct nomount_leaf *nm_find_leaf_in_dir(struct nomount_dir_node *dir_nod
         leaf = nomount_bsearch_child(children, name, len, hash, NULL);
     }
     return leaf;
-}
-
-static inline void nm_mark_uncacheable(struct dentry *dentry)
-{
-    if (dentry) d_drop(dentry);
 }
 
 static void nm_dir_rcu_free(struct rcu_head *head)
@@ -210,7 +179,8 @@ static NM_ACTOR_RET nomount_actor_proxy(struct dir_context *ctx, const char *nam
 
     {
         rcu_guard();
-        if (unlikely(nm_lookup_rule(proxy->dir_node, name, namelen, proxy->fsuid, NULL) != NULL)) {
+        struct nomount_leaf *leaf = nm_find_leaf_in_dir(proxy->dir_node, name, namelen);
+        if (unlikely(leaf && nm_select_rule(leaf, proxy->fsuid))) {
             proxy->ctx.pos = offset;
             return NM_ACTOR_CONTINUE;
         }
@@ -364,7 +334,7 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
                 special = (nm_per_uid_view_active() || nm_leaf_is_uid_dependent(leaf));
                 uid_t fsuid = current_fsuid().val;
                 if (likely(!nomount_is_uid_blocked(fsuid)))
-                    found = nm_resolve_rule_from_leaf(dir_node, leaf, fsuid, &rule_info);
+                    found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
             }
         }
     }
@@ -378,7 +348,7 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
         return ERR_PTR(-EOPNOTSUPP);
 
     if (special && !IS_ERR(res))
-        nm_mark_uncacheable(res ? res : dentry);
+        d_drop(res ? res : dentry);
     return res;
 }
 
@@ -731,7 +701,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         if (leaf) {
             special = (nm_per_uid_view_active() || nm_leaf_is_uid_dependent(leaf));
             if (likely(!uid_blocked))
-                found = nm_resolve_rule_from_leaf(dir_node, leaf, fsuid, &rule_info);
+                found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
         }
     }
     rcu_read_unlock();
@@ -742,7 +712,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info);
         if (special && !IS_ERR(res))
-            nm_mark_uncacheable(res ? res : dentry);
+            d_drop(res ? res : dentry);
         return res;
     }
 
@@ -756,7 +726,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (r_dir->i_op->lookup) {
         res = r_dir->i_op->lookup(r_dir, dentry, flags);
         if (special && !IS_ERR(res))
-            nm_mark_uncacheable(res ? res : dentry);
+            d_drop(res ? res : dentry);
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -764,7 +734,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 negative_dentry:
     d_add(dentry, NULL);
     if (special)
-        nm_mark_uncacheable(dentry);
+        d_drop(dentry);
     return NULL;
 }
 
