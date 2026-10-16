@@ -314,6 +314,7 @@ static inline void nm_mark_uncacheable(struct dentry *dentry)
 #endif
 }
 
+static int nm_cached_inode_set(struct inode *inode, void *data) { return 0; }
 static int nm_cached_inode_test(struct inode *inode, void *data)
 {
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
@@ -342,7 +343,7 @@ static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dent
     if (rule_info->this_dir) {
         probe.r_path = rule_info->r_path;
         probe.dir_node = rule_info->this_dir;
-        inode = iget5_locked(dir->i_sb, (unsigned long)rule_info->this_dir, nm_cached_inode_test, NULL, &probe);
+        inode = iget5_locked(dir->i_sb, (unsigned long)rule_info->this_dir, nm_cached_inode_test, nm_cached_inode_set, &probe);
         if (!inode) goto out;
         if (!nm_inode_is_new(inode)) {
             res = d_splice_alias(inode, dentry);
