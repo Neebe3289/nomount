@@ -39,6 +39,18 @@ static __always_inline bool nm_child_matches(struct nomount_leaf *leaf, const ch
     return child_name[0] == name[0] && child_name[len - 1] == name[len - 1] && !memcmp(child_name, name, len);
 }
 
+static inline bool nm_per_uid_view_active(void)
+{
+    return rcu_access_pointer(nomount_uids) != NULL || READ_ONCE(nm_block_isolated_uids);
+}
+
+static bool nm_leaf_is_uid_dependent(struct nomount_leaf *leaf)
+{
+    struct nm_rule_array *arr = rcu_dereference(leaf->rules);
+    if (!arr || !arr->count) return false;
+    return arr->rules[arr->count - 1].target_uid != 0;
+}
+
 static __always_inline struct nomount_leaf *nomount_bsearch_child(struct nomount_child_array *arr, const char *name, size_t len, u32 hash, int *index)
 {
 	struct nm_child *entries = nm_entries(arr);
@@ -99,23 +111,45 @@ static struct nm_rule *nm_lookup_rule(struct nomount_dir_node *dir_node, const c
     return rule;
 }
 
-static bool nm_resolve_rule(struct nomount_dir_node *dir_node, const char *name, size_t len, uid_t fsuid, struct nm_rule_info *out)
+static bool nm_resolve_rule_from_leaf(struct nomount_dir_node *dir_node, struct nomount_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
 {
-    struct nomount_leaf *leaf = NULL;
-    struct nm_rule *rule;
+    struct nm_rule *rule = nm_select_rule(leaf, fsuid);
+    if (!rule) return false;
+    out->flags = rule->flags;
+    out->v_ino = leaf->v_ino;
+    out->r_path = rule->r_path;
+    out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
+    if (out->r_path.dentry) path_get(&out->r_path);
+    if (out->this_dir) atomic_inc(&out->this_dir->refs);
+    return true;
+}
 
-    rcu_guard();
-    rule = nm_lookup_rule(dir_node, name, len, fsuid, &leaf);
-    if (rule) {
-        out->flags = rule->flags;
-        out->v_ino = leaf->v_ino;
-        out->r_path = rule->r_path;
-        out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
-        if (out->r_path.dentry) path_get(&out->r_path);
-        if (out->this_dir) atomic_inc(&out->this_dir->refs);
-        return true;
+static struct nomount_leaf *nm_find_leaf_in_dir(struct nomount_dir_node *dir_node, const char *name, size_t len)
+{
+    struct nomount_child_array *children;
+    struct nomount_leaf *leaf = NULL;
+
+    if (!dir_node || !(children = rcu_dereference(dir_node->children)))
+        return NULL;
+    u32 bloom_h = nm_qhash(name, len);
+    if (!children->bloom_words) {
+        struct nm_child *entries = nm_entries(children);
+        for (int i = 0; i < children->count; i++) {
+            if (entries[i].bloom_hash == bloom_h && nm_child_matches(entries[i].leaf, name, len)) {
+                leaf = entries[i].leaf;
+                break;
+            }
+        }
+    } else if (unlikely(nm_bloom_test(children, bloom_h))) {
+        u32 hash = full_name_hash((const void *)(unsigned long)NOMOUNT_MAGIC_SIG, name, len);
+        leaf = nomount_bsearch_child(children, name, len, hash, NULL);
     }
-    return false;
+    return leaf;
+}
+
+static inline void nm_mark_uncacheable(struct dentry *dentry)
+{
+    if (dentry) d_drop(dentry);
 }
 
 static void nm_dir_rcu_free(struct rcu_head *head)
@@ -282,6 +316,7 @@ static int nm_cached_inode_set(struct inode *inode, void *data)
     return 0;
 }
 
+
 static struct dentry *nm_materialize_rule(struct inode *dir, struct dentry *dentry, struct nm_rule_info *rule_info)
 {
     struct nm_inode_info *info = NULL;
@@ -322,27 +357,36 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
 {
     const struct inode_operations *orig_iop = NULL;
     struct nm_rule_info rule_info = {0};
+    struct nomount_dir_node *dir_node;
     struct nm_dir_ops *nm_iop = NULL;
-    bool found = false;
+    struct nomount_leaf *leaf = NULL;
+    struct dentry *res;
+    bool special = false, found = false;
 
     rcu_read_lock();
     if (likely((nm_iop = nm_get_nm_iop(rcu_dereference(dir->i_op))))) {
         orig_iop = nm_iop->orig_iop;
-        uid_t fsuid = current_fsuid().val;
-        if (likely(!nomount_is_uid_blocked(fsuid))) {
-            struct nomount_dir_node *dir_node = rcu_dereference(nm_iop->dir_node);
-            if (dir_node) found = nm_resolve_rule(dir_node, dentry->d_name.name, dentry->d_name.len, fsuid, &rule_info);
+        if ((dir_node = rcu_dereference(nm_iop->dir_node))) {
+            if ((leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len))) {
+                special = (nm_per_uid_view_active() || nm_leaf_is_uid_dependent(leaf));
+                uid_t fsuid = current_fsuid().val;
+                if (likely(!nomount_is_uid_blocked(fsuid)))
+                    found = nm_resolve_rule_from_leaf(dir_node, leaf, fsuid, &rule_info);
+            }
         }
     }
     rcu_read_unlock();
 
     if (found)
-        return nm_materialize_rule(dir, dentry, &rule_info);
+        res = nm_materialize_rule(dir, dentry, &rule_info);
+    else if (likely(orig_iop && orig_iop->lookup))
+        res = orig_iop->lookup(dir, dentry, flags);
+    else
+        return ERR_PTR(-EOPNOTSUPP);
 
-    if (likely(orig_iop && orig_iop->lookup))
-        return orig_iop->lookup(dir, dentry, flags);
-
-    return ERR_PTR(-EOPNOTSUPP);
+    if (special && !IS_ERR(res))
+        nm_mark_uncacheable(res ? res : dentry);
+    return res;
 }
 
 static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *ctx)
@@ -680,13 +724,34 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     struct nm_inode_info *info = dir->i_private;
     struct nm_rule_info rule_info = {0};
     struct nomount_dir_node *dir_node;
+    struct dentry *res;
     uid_t fsuid = current_fsuid().val;
+    bool special = false, found = false, uid_blocked;
 
-    if (unlikely(nomount_is_uid_blocked(fsuid)))
+    if (unlikely(!info))
         goto negative_dentry;
 
-    if ((dir_node = READ_ONCE(info->dir_node)) && nm_resolve_rule(dir_node, dentry->d_name.name, dentry->d_name.len, fsuid, &rule_info))
-        return nm_materialize_rule(dir, dentry, &rule_info);
+    uid_blocked = nomount_is_uid_blocked(fsuid);
+    rcu_read_lock();
+    if ((dir_node = READ_ONCE(info->dir_node))) {
+        struct nomount_leaf *leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
+        if (leaf) {
+            special = (nm_per_uid_view_active() || nm_leaf_is_uid_dependent(leaf));
+            if (likely(!uid_blocked))
+                found = nm_resolve_rule_from_leaf(dir_node, leaf, fsuid, &rule_info);
+        }
+    }
+    rcu_read_unlock();
+
+    if (unlikely(uid_blocked))
+        goto negative_dentry;
+
+    if (found) {
+        res = nm_materialize_rule(dir, dentry, &rule_info);
+        if (special && !IS_ERR(res))
+            nm_mark_uncacheable(res ? res : dentry);
+        return res;
+    }
 
     if (!info->r_path.dentry)
         goto negative_dentry;
@@ -694,12 +759,19 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     struct inode *r_dir = d_backing_inode(info->r_path.dentry);
     if (!r_dir)
         goto negative_dentry;
-    if (r_dir->i_op->lookup)
-        return r_dir->i_op->lookup(r_dir, dentry, flags);
+
+    if (r_dir->i_op->lookup) {
+        res = r_dir->i_op->lookup(r_dir, dentry, flags);
+        if (special && !IS_ERR(res))
+            nm_mark_uncacheable(res ? res : dentry);
+        return res;
+    }
     return ERR_PTR(-EOPNOTSUPP);
 
 negative_dentry:
     d_add(dentry, NULL);
+    if (special)
+        nm_mark_uncacheable(dentry);
     return NULL;
 }
 
