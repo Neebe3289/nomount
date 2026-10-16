@@ -66,10 +66,10 @@ static __always_inline struct nomount_leaf *nomount_bsearch_child(struct nomount
 	return NULL;
 }
 
-static struct nm_rule *nm_select_rule(struct nomount_leaf *leaf, unsigned int uid)
+static struct nm_rule *nm_select_rule(struct nm_rule_array *arr, unsigned int uid)
 {
-    struct nm_rule_array *arr = rcu_dereference_check(leaf->rules, lockdep_is_held(&nomount_mutex));
     if (!arr) return NULL;
+    if (!arr->uid_dependent) return &arr->rules[0];
     for (int i = 0; i < arr->count; i++) {
         struct nm_rule *r = &arr->rules[i];
         if (r->target_uid == uid) return r;
@@ -78,25 +78,9 @@ static struct nm_rule *nm_select_rule(struct nomount_leaf *leaf, unsigned int ui
     return !arr->rules[0].target_uid ? &arr->rules[0] : NULL;
 }
 
-static bool nm_resolve_rule_default(struct nomount_leaf *leaf, struct nm_rule_info *out)
+static bool nm_resolve_rule_from_leaf(struct nomount_leaf *leaf, struct nm_rule_array *arr, uid_t fsuid, struct nm_rule_info *out)
 {
-    struct nm_rule_array *arr = rcu_dereference_check(leaf->rules, lockdep_is_held(&nomount_mutex));
-    struct nm_rule *rule;
-
-    if (!arr || !arr->count || arr->rules[0].target_uid) return false;
-    rule = &arr->rules[0];
-    out->flags = rule->flags;
-    out->v_ino = leaf->v_ino;
-    out->r_path = rule->r_path;
-    out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
-    if (out->r_path.dentry) path_get(&out->r_path);
-    if (out->this_dir) atomic_inc(&out->this_dir->refs);
-    return true;
-}
-
-static bool nm_resolve_rule_from_leaf(struct nomount_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
-{
-    struct nm_rule *rule = nm_select_rule(leaf, fsuid);
+    struct nm_rule *rule = nm_select_rule(arr, fsuid);
     if (!rule) return false;
     out->flags = rule->flags;
     out->v_ino = leaf->v_ino;
@@ -189,7 +173,7 @@ static NM_ACTOR_RET nomount_actor_proxy(struct dir_context *ctx, const char *nam
     {
         rcu_guard();
         struct nomount_leaf *leaf = nm_find_leaf_in_dir(proxy->dir_node, name, namelen);
-        if (unlikely(leaf && nm_select_rule(leaf, proxy->fsuid))) {
+        if (unlikely(leaf && nm_select_rule(rcu_dereference(leaf->rules), proxy->fsuid))) {
             proxy->ctx.pos = offset;
             return NM_ACTOR_CONTINUE;
         }
@@ -219,7 +203,7 @@ static inline void __nomount_emit_virtual_children(struct dir_context *ctx, stru
 		struct nomount_child_array *array = rcu_dereference(dir_node->children);
 		if (array && id < array->count) {
 			struct nomount_leaf *leaf = nm_entries(array)[id].leaf;
-			struct nm_rule *rule = nm_select_rule(leaf, fsuid);
+			struct nm_rule *rule = nm_select_rule(rcu_dereference(leaf->rules), fsuid);
 			has_more = true;
 			if (rule && !(rule->flags & NM_FLAG_WHITEOUT)) {
 				name_len = leaf->child_len;
@@ -388,15 +372,12 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
         orig_iop = nm_iop->orig_iop;
         if ((dir_node = rcu_dereference(nm_iop->dir_node))) {
             if ((leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len))) {
-                if (likely(!nm_per_uid_view_active())) {
-                    special = leaf->uid_dependent;
-                    found = special ? nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info)
-                                    : nm_resolve_rule_default(leaf, &rule_info);
-                } else {
-                    special = true;
-                    uid_t fsuid = current_fsuid().val;
-                    if (likely(!nomount_is_uid_blocked(fsuid)))
-                        found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+                struct nm_rule_array *arr = rcu_dereference(leaf->rules);
+                special = nm_per_uid_view_active();
+                uid_t fsuid = (special || (arr && arr->uid_dependent)) ? current_fsuid().val : 0;
+                if (!special || likely(!nomount_is_uid_blocked(fsuid))) {
+                    special = special || !arr || arr->uid_dependent;
+                    found = nm_resolve_rule_from_leaf(leaf, arr, fsuid, &rule_info);
                 }
             }
         }
@@ -760,15 +741,12 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if ((dir_node = READ_ONCE(info->dir_node))) {
         struct nomount_leaf *leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
         if (leaf) {
-            if (likely(!nm_per_uid_view_active())) {
-                special = leaf->uid_dependent;
-                found = special ? nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info)
-                                : nm_resolve_rule_default(leaf, &rule_info);
-            } else {
-                special = true;
-                uid_t fsuid = current_fsuid().val;
-                if (likely(!(uid_blocked = nomount_is_uid_blocked(fsuid))))
-                    found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+            struct nm_rule_array *arr = rcu_dereference(leaf->rules);
+            special = nm_per_uid_view_active();
+            uid_t fsuid = (special || (arr && arr->uid_dependent)) ? current_fsuid().val : 0;
+            if (!special || likely(!(uid_blocked = nomount_is_uid_blocked(fsuid)))) {
+                special = special || !arr || arr->uid_dependent;
+                found = nm_resolve_rule_from_leaf(leaf, arr, fsuid, &rule_info);
             }
         }
     }
@@ -1334,7 +1312,7 @@ static int nomount_generate_virtual_topology(struct nomount_leaf *target, unsign
         int name_len = len - slash - 1;
 
         if ((parent = nm_find_leaf(target->paths, parent_len))) {
-            struct nm_rule *rule = nm_select_rule(parent, uid);
+            struct nm_rule *rule = nm_select_rule(rcu_dereference_protected(parent->rules, lockdep_is_held(&nomount_mutex)), uid);
             int hijacked = 0;
             if ((rule && !(rule->flags & NM_FLAG_IS_DIR)) || !parent->this_dir) { err = -ENOTDIR; break; }
             if (parent->anchor.dentry && (hijacked = nomount_hijack_dir_ops(parent->this_dir, d_backing_inode(parent->anchor.dentry))) < 0) {
@@ -1404,6 +1382,7 @@ static int nomount_generate_virtual_topology(struct nomount_leaf *target, unsign
         memset(&rules->rules[0], 0, sizeof(struct nm_rule));
         rules->rules[0].flags = NM_FLAG_IS_DIR | NM_FLAG_VIRTUAL_DIR;
         nm_rule_heap(rules)[0] = '\0';
+        rules->uid_dependent = false;
         RCU_INIT_POINTER(parent->rules, rules);
 
         hlist_add_head(&parent->ht_node, &pending);
@@ -1539,9 +1518,9 @@ static int __nomount_add_rule(const char *v_path, const char *r_path, u16 v_len,
     kfree(r_buf);
     r_buf = NULL;
 
+    array->uid_dependent = array->count && array->rules[array->count - 1].target_uid != 0;
     if (fresh) {
         RCU_INIT_POINTER(leaf->rules, array);
-        leaf->uid_dependent = array->count && array->rules[array->count - 1].target_uid != 0;
         if ((err = nomount_generate_virtual_topology(leaf, uid))) {
             nm_rule_array_free(array);
             nm_free_leaf(leaf);
@@ -1551,7 +1530,6 @@ static int __nomount_add_rule(const char *v_path, const char *r_path, u16 v_len,
     } else {
         if (new_dir) { leaf->this_dir = new_dir; new_dir->owner = leaf; }
         rcu_assign_pointer(leaf->rules, array);
-        leaf->uid_dependent = array->count && array->rules[array->count - 1].target_uid != 0;
         if (old) nm_retire_array(old);
     }
 
@@ -1619,8 +1597,8 @@ static int __nomount_del_rule(const char *path, u16 len, unsigned int uid)
         j++;
     }
 
+    array->uid_dependent = array->count && array->rules[array->count - 1].target_uid != 0;
     rcu_assign_pointer(leaf->rules, array);
-    leaf->uid_dependent = array->count && array->rules[array->count - 1].target_uid != 0;
     nm_retire_array(old);
     return 0;
 }

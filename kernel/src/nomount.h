@@ -105,6 +105,7 @@ struct nm_rule {
 struct nm_rule_array {
     struct nm_rule_array *next;
     int count;
+    bool uid_dependent;
     struct nm_rule rules[];
 };
 
@@ -117,7 +118,6 @@ struct nomount_leaf {
     u32 v_hash;
     u16 v_len;
     u16 child_len;
-    bool uid_dependent;
     struct hlist_node ht_node;
     struct nomount_leaf *next;
     char paths[];
