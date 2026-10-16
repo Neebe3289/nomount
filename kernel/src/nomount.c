@@ -324,10 +324,15 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
         orig_iop = nm_iop->orig_iop;
         if ((dir_node = rcu_dereference(nm_iop->dir_node))) {
             if ((leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len))) {
-                special = (nm_per_uid_view_active() || leaf->uid_dependent);
-                uid_t fsuid = current_fsuid().val;
-                if (likely(!nomount_is_uid_blocked(fsuid)))
-                    found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+                if (likely(!nm_per_uid_view_active())) {
+                    special = leaf->uid_dependent;
+                    found = nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info);
+                } else {
+                    special = true;
+                    uid_t fsuid = current_fsuid().val;
+                    if (likely(!nomount_is_uid_blocked(fsuid)))
+                        found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+                }
             }
         }
     }
@@ -681,20 +686,24 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     struct nm_rule_info rule_info = {0};
     struct nomount_dir_node *dir_node;
     struct dentry *res;
-    uid_t fsuid = current_fsuid().val;
-    bool special = false, found = false, uid_blocked;
+    bool special = false, found = false, uid_blocked = false;
 
     if (unlikely(!info))
         goto negative_dentry;
 
-    uid_blocked = nomount_is_uid_blocked(fsuid);
     rcu_read_lock();
     if ((dir_node = READ_ONCE(info->dir_node))) {
         struct nomount_leaf *leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len);
         if (leaf) {
-            special = (nm_per_uid_view_active() || leaf->uid_dependent);
-            if (likely(!uid_blocked))
-                found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+            if (likely(!nm_per_uid_view_active())) {
+                special = leaf->uid_dependent;
+                found = nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info);
+            } else {
+                special = true;
+                uid_t fsuid = current_fsuid().val;
+                if (likely(!(uid_blocked = nomount_is_uid_blocked(fsuid))))
+                    found = nm_resolve_rule_from_leaf(leaf, fsuid, &rule_info);
+            }
         }
     }
     rcu_read_unlock();
