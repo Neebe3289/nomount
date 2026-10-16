@@ -117,6 +117,7 @@ struct nomount_leaf {
     u32 v_hash;
     u16 v_len;
     u16 child_len;
+    bool uid_dependent;
     struct hlist_node ht_node;
     struct nomount_leaf *next;
     char paths[];
