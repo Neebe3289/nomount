@@ -251,6 +251,52 @@ static void nomount_init_prealloc_inode(struct inode *inode, struct nm_inode_inf
     if (!S_ISLNK(inode->i_mode)) inode->i_opflags |= IOP_NOFOLLOW;
 }
 
+#ifndef DCACHE_DONTCACHE
+struct nm_dops {
+    struct dentry_operations fake;
+    const struct dentry_operations *orig;
+    struct rcu_head rcu;
+};
+
+static int nm_d_delete(const struct dentry *dentry) { return 1; }
+static void nm_d_release(struct dentry *dentry)
+{
+    struct nm_dops *ops = container_of(dentry->d_op, struct nm_dops, fake);
+    if (ops->orig && ops->orig->d_release)
+        ops->orig->d_release(dentry);
+    kfree_rcu(ops, rcu);
+}
+#endif
+
+static inline void nm_mark_uncacheable(struct dentry *dentry)
+{
+    if (!dentry) return;
+#ifdef DCACHE_DONTCACHE
+    spin_lock(&dentry->d_lock);
+    dentry->d_flags |= DCACHE_DONTCACHE;
+    spin_unlock(&dentry->d_lock);
+#else
+    if (dentry->d_op && dentry->d_op->d_release == nm_d_release)
+        return;   /* already ours */
+
+    struct nm_dops *ops = kzalloc(sizeof(*ops), GFP_KERNEL);
+    if (!ops) { d_drop(dentry); return; }
+
+    spin_lock(&dentry->d_lock);
+    if (dentry->d_op && dentry->d_op->d_release == nm_d_release) {
+        spin_unlock(&dentry->d_lock);
+        kfree(ops);
+        return;
+    }
+    if (ops->orig) ops->fake = *(ops->orig = dentry->d_op);
+    ops->fake.d_delete = nm_d_delete;
+    ops->fake.d_release = nm_d_release;
+    dentry->d_op = &ops->fake;
+    dentry->d_flags |= DCACHE_OP_DELETE;
+    spin_unlock(&dentry->d_lock);
+#endif
+}
+
 static int nm_cached_inode_test(struct inode *inode, void *data)
 {
     struct nm_inode_info *info = READ_ONCE(inode->i_private);
@@ -346,7 +392,7 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
         return ERR_PTR(-EOPNOTSUPP);
 
     if (special && !IS_ERR(res))
-        d_drop(res ? res : dentry);
+        nm_mark_uncacheable(res ? res : dentry);
     return res;
 }
 
@@ -714,7 +760,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info);
         if (special && !IS_ERR(res))
-            d_drop(res ? res : dentry);
+            nm_mark_uncacheable(res ? res : dentry);
         return res;
     }
 
@@ -728,7 +774,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (r_dir->i_op->lookup) {
         res = r_dir->i_op->lookup(r_dir, dentry, flags);
         if (special && !IS_ERR(res))
-            d_drop(res ? res : dentry);
+            nm_mark_uncacheable(res ? res : dentry);
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -736,7 +782,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 negative_dentry:
     d_add(dentry, NULL);
     if (special)
-        d_drop(dentry);
+        nm_mark_uncacheable(dentry);
     return NULL;
 }
 
