@@ -78,6 +78,22 @@ static struct nm_rule *nm_select_rule(struct nomount_leaf *leaf, unsigned int ui
     return !arr->rules[0].target_uid ? &arr->rules[0] : NULL;
 }
 
+static bool nm_resolve_rule_default(struct nomount_leaf *leaf, struct nm_rule_info *out)
+{
+    struct nm_rule_array *arr = rcu_dereference_check(leaf->rules, lockdep_is_held(&nomount_mutex));
+    struct nm_rule *rule;
+
+    if (!arr || !arr->count || arr->rules[0].target_uid) return false;
+    rule = &arr->rules[0];
+    out->flags = rule->flags;
+    out->v_ino = leaf->v_ino;
+    out->r_path = rule->r_path;
+    out->this_dir = (rule->flags & NM_FLAG_IS_DIR) ? leaf->this_dir : NULL;
+    if (out->r_path.dentry) path_get(&out->r_path);
+    if (out->this_dir) atomic_inc(&out->this_dir->refs);
+    return true;
+}
+
 static bool nm_resolve_rule_from_leaf(struct nomount_leaf *leaf, uid_t fsuid, struct nm_rule_info *out)
 {
     struct nm_rule *rule = nm_select_rule(leaf, fsuid);
@@ -371,7 +387,8 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
             if ((leaf = nm_find_leaf_in_dir(dir_node, dentry->d_name.name, dentry->d_name.len))) {
                 if (likely(!nm_per_uid_view_active())) {
                     special = leaf->uid_dependent;
-                    found = nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info);
+                    found = special ? nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info)
+                                    : nm_resolve_rule_default(leaf, &rule_info);
                 } else {
                     special = true;
                     uid_t fsuid = current_fsuid().val;
@@ -742,7 +759,8 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
         if (leaf) {
             if (likely(!nm_per_uid_view_active())) {
                 special = leaf->uid_dependent;
-                found = nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info);
+                found = special ? nm_resolve_rule_from_leaf(leaf, current_fsuid().val, &rule_info)
+                                : nm_resolve_rule_default(leaf, &rule_info);
             } else {
                 special = true;
                 uid_t fsuid = current_fsuid().val;
