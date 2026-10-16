@@ -251,53 +251,6 @@ static void nomount_init_prealloc_inode(struct inode *inode, struct nm_inode_inf
     if (!S_ISLNK(inode->i_mode)) inode->i_opflags |= IOP_NOFOLLOW;
 }
 
-#ifndef DCACHE_DONTCACHE
-struct nm_dops {
-    struct dentry_operations fake;
-    const struct dentry_operations *orig;
-    struct rcu_head rcu;
-};
-
-static int nm_d_delete(const struct dentry *dentry) { return 1; }
-static void nm_d_release(struct dentry *dentry)
-{
-    struct nm_dops *ops = container_of(dentry->d_op, struct nm_dops, fake);
-    if (ops->orig && ops->orig->d_release)
-        ops->orig->d_release(dentry);
-    kfree_rcu(ops, rcu);
-}
-#endif
-
-static inline void nm_mark_uncacheable(struct dentry *dentry)
-{
-    if (!dentry) return;
-#ifdef DCACHE_DONTCACHE
-    spin_lock(&dentry->d_lock);
-    dentry->d_flags |= DCACHE_DONTCACHE;
-    spin_unlock(&dentry->d_lock);
-#else
-    if (dentry->d_op && dentry->d_op->d_release == nm_d_release)
-        return;   /* already ours */
-
-    struct nm_dops *ops = kzalloc(sizeof(*ops), GFP_KERNEL);
-    if (!ops) { d_drop(dentry); return; }
-
-    spin_lock(&dentry->d_lock);
-    if (dentry->d_op && dentry->d_op->d_release == nm_d_release) {
-        spin_unlock(&dentry->d_lock);
-        kfree(ops);
-        return;
-    }
-    ops->orig = dentry->d_op;
-    if (ops->orig) ops->fake = *ops->orig;
-    ops->fake.d_delete = nm_d_delete;
-    ops->fake.d_release = nm_d_release;
-    dentry->d_op = &ops->fake;
-    dentry->d_flags |= DCACHE_OP_DELETE;
-    spin_unlock(&dentry->d_lock);
-#endif
-}
-
 static int nm_cached_inode_set(struct inode *inode, void *data) { return 0; }
 static int nm_cached_inode_test(struct inode *inode, void *data)
 {
@@ -392,7 +345,7 @@ static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *
         return ERR_PTR(-EOPNOTSUPP);
 
     if (special && !IS_ERR(res))
-        nm_mark_uncacheable(res ? res : dentry);
+        nm_mark_uncacheable(res ? res : dentry, special);
     return res;
 }
 
@@ -758,7 +711,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (found) {
         res = nm_materialize_rule(dir, dentry, &rule_info);
         if (special && !IS_ERR(res))
-            nm_mark_uncacheable(res ? res : dentry);
+            nm_mark_uncacheable(res ? res : dentry, special);
         return res;
     }
 
@@ -772,7 +725,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
     if (r_dir->i_op->lookup) {
         res = r_dir->i_op->lookup(r_dir, dentry, flags);
         if (special && !IS_ERR(res))
-            nm_mark_uncacheable(res ? res : dentry);
+            nm_mark_uncacheable(res ? res : dentry, special);
         return res;
     }
     return ERR_PTR(-EOPNOTSUPP);
@@ -780,7 +733,7 @@ static struct dentry *nm_dir_lookup(struct inode *dir, struct dentry *dentry, un
 negative_dentry:
     d_add(dentry, NULL);
     if (special)
-        nm_mark_uncacheable(dentry);
+        nm_mark_uncacheable(dentry, true);
     return NULL;
 }
 
@@ -827,6 +780,81 @@ static int nm_xattr_set(const struct xattr_handler *handler, IDMAP_ARG struct de
         return __vfs_setxattr(IDMAP_PATH(info->r_path) info->r_path.dentry, d_inode(info->r_path.dentry), xattr_full_name(handler, name), buffer, size, flags);
     }
     return proxy->orig->set(proxy->orig, IDMAP_CALL dentry, inode, name, buffer, size, flags);
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
+static int nm_d_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags)
+#else
+static int nm_d_revalidate(struct dentry *dentry, unsigned int flags)
+#endif
+{
+    struct nm_dops *ops;
+    uid_t fsuid;
+
+    if (likely(!nm_per_uid_view_active()) || unlikely(!dentry->d_op || dentry->d_op->d_revalidate != nm_d_revalidate))
+        return 1;
+
+    fsuid = current_fsuid().val;
+    ops = container_of(dentry->d_op, struct nm_dops, fake);
+    if (ops->uid_dependent) {
+        if (likely(ops->view_uid == fsuid))
+            return 1;
+    } else {
+        if (likely(!nomount_is_uid_blocked(fsuid)))
+            return 1;
+    }
+
+    if (flags & LOOKUP_RCU) return -ECHILD;
+    d_drop(dentry);
+    return 0;
+}
+
+#ifndef DCACHE_DONTCACHE
+static int nm_d_delete(const struct dentry *dentry) { return 1; }
+#endif
+
+static void nm_d_release(struct dentry *dentry)
+{
+    struct nm_dops *ops = container_of(dentry->d_op, struct nm_dops, fake);
+    if (ops->orig && ops->orig->d_release)
+        ops->orig->d_release(dentry);
+    kfree_rcu(ops, rcu);
+}
+
+static inline void nm_mark_uncacheable(struct dentry *dentry, bool uid_dependent)
+{
+    struct nm_dops *ops;
+
+    if (!dentry || (dentry->d_op && dentry->d_op->d_revalidate == nm_d_revalidate))
+        return;
+
+    if (unlikely(!(ops = kzalloc(sizeof(*ops), GFP_KERNEL)))) { d_drop(dentry); return; }
+
+    spin_lock(&dentry->d_lock);
+    if (dentry->d_op && dentry->d_op->d_revalidate == nm_d_revalidate) {
+        spin_unlock(&dentry->d_lock);
+        kfree(ops);
+    } else {
+        ops->orig = dentry->d_op;
+        if (ops->orig) ops->fake = *ops->orig;
+        ops->fake.d_revalidate = nm_d_revalidate;
+        ops->fake.d_release    = nm_d_release;
+#ifndef DCACHE_DONTCACHE
+        ops->fake.d_delete     = nm_d_delete;
+        dentry->d_flags |= DCACHE_OP_DELETE;
+#endif
+        ops->uid_dependent = uid_dependent;
+        ops->view_uid      = uid_dependent ? current_fsuid().val : 0;
+        dentry->d_op = &ops->fake;
+        dentry->d_flags |= DCACHE_OP_REVALIDATE;
+        spin_unlock(&dentry->d_lock);
+    }
+
+#ifdef DCACHE_DONTCACHE
+    spin_lock(&dentry->d_lock);
+    dentry->d_flags |= DCACHE_DONTCACHE;
+    spin_unlock(&dentry->d_lock);
+#endif
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)

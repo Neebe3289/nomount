@@ -58,6 +58,14 @@ struct nm_dir_ops {
     struct rcu_head rcu;
 };
 
+struct nm_dops {
+    struct dentry_operations fake;
+    const struct dentry_operations *orig;
+    bool uid_dependent;
+    uid_t view_uid;
+    struct rcu_head rcu;
+};
+
 struct nm_sop {
     struct super_operations fake_sop; /* MUST be exactly at offset 0 */
     const struct super_operations *orig_sop;
@@ -179,6 +187,7 @@ static const struct inode_operations nm_dir_iops;
 static struct dentry *nomount_hijacked_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags);
 static int nomount_hijacked_iterate_dir(struct file *file, struct dir_context *ctx);
 static void nomount_hijacked_evict_inode(struct inode *inode);
+static void nm_mark_uncacheable(struct dentry *dentry, bool uid_dependent);
 static void nm_dir_put(struct nomount_dir_node *dir_node);
 
 /* =====================================================================
